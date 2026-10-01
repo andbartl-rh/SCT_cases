@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.DS_Store
+tam_config.json
+tam_state.json
+tam_slack_routes.json
+gql_post_body.txt
