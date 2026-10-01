@@ -4,4 +4,5 @@ __pycache__/
 tam_config.json
 tam_state.json
 tam_slack_routes.json
+tam_contacts.json
 gql_post_body.txt
