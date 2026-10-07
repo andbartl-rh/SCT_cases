@@ -5,4 +5,8 @@ tam_config.json
 tam_state.json
 tam_slack_routes.json
 tam_contacts.json
+tam_latency_log.jsonl
+tam_jira_alert_cache.json
+tam_sd_gaming_cache.json
+tam_owner_alert_cache.json
 gql_post_body.txt

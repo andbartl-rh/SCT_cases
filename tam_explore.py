@@ -60,7 +60,7 @@ def quarter_bounds(label: str):
     return start, end
 
 
-def fetch_all_for_account(account_keyword: str, max_pages: int = 50, stop_before=None):
+def fetch_all_for_account(account_keyword: str, max_pages: int = 100, stop_before=None):
     cases, cursor, page = [], None, 0
     while page < max_pages:
         after = f'after: "{cursor}"' if cursor else ""
@@ -68,7 +68,7 @@ def fetch_all_for_account(account_keyword: str, max_pages: int = 50, stop_before
 query ExploreCases {{
   redhat_support_uiapi {{ query {{
     RedHatSupportCase(
-      first: 200
+      first: 100
       {after}
       orderBy: {{ CreatedDate: {{ order: DESC }} }}
       where: {{ and: [

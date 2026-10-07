@@ -20,6 +20,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -49,8 +50,14 @@ CONTACTS_PATH = HERE / "tam_contacts.json"
 CONFIG_PATH = HERE / "tam_config.json"
 SLACK_ROUTES_PATH = HERE / "tam_slack_routes.json"
 BACKUP_ACCOUNTS_PATH = HERE / "tam_backup_accounts.json"
+LATENCY_LOG_PATH = HERE / "tam_latency_log.jsonl"
+LATENCY_LOG_MAX_LINES = 10000
+JIRA_ALERT_CACHE_PATH = HERE / "tam_jira_alert_cache.json"
+SD_GAMING_CACHE_PATH = HERE / "tam_sd_gaming_cache.json"
+OWNER_ALERT_CACHE_PATH = HERE / "tam_owner_alert_cache.json"
 TOKEN_PATH = Path.home() / ".rh_offline_token"
 TOKEN_CACHE_PATH = Path.home() / ".rh_access_token_cache"
+JIRA_TOKEN_PATH = Path.home() / ".rh_atlassian_token"
 
 SSO_TOKEN_URL = (
     "https://sso.redhat.com/auth/realms/redhat-external"
@@ -59,14 +66,30 @@ SSO_TOKEN_URL = (
 GRAPHQL_URL = "https://graphql.redhat.com"
 PORTAL_CASE = "https://access.redhat.com/support/cases/#/case/{number}"
 SFDC_CASE = "https://redhatsupport.lightning.force.com/lightning/r/Case/{id}/view"
+JIRA_BASE = "https://redhat.atlassian.net"
+JIRA_BROWSE_URL = JIRA_BASE + "/browse/{key}"
+JIRA_RE = re.compile(
+    r"(?:issues\.redhat\.com|redhat\.atlassian\.net)/browse/([A-Z][A-Z0-9]+-\d+)"
+)
+
+# Named Red Hat colleague TAMs on shared accounts. Exact SFDC display names,
+# confirmed by the TAM — not a fuzzy customer-contact list. Empty until Andy
+# names colleagues; add them here and ✱ / --mine visibility light up.
+CO_TAMS: Dict[str, List[str]] = {}
 
 UNCLAIMED_DAYS = 14
+CASE_HISTORY_WINDOW_HOURS = 4
+CASE_ROUNDTRIP_HOURS = 48
 PAGE_SIZE = 200
 MAX_CASE_PAGES = 5
 HTTP_TIMEOUT = 60
+GQL_TIMEOUT = 30
+PAGE_SLEEP = 0.1
+BATCH_SLEEP = 0.15
 API_CALLS = 0
 LAST_FETCH: Dict[str, Any] = {"calls": 0, "seconds": 0.0, "records": 0, "breach": 0}
 LAST_WOC: Dict[str, Dict[str, Any]] = {}
+LAST_CASE_JIRAS: Dict[str, List[str]] = {}
 
 ACCOUNT_PALETTE = ["#3ecfcf", "#7dce82", "#e0b44a", "#c678dd", "#7aa2f7", "#e06c75"]
 STAT_DISPLAY = {
@@ -165,6 +188,7 @@ RED = "\033[31m"
 GREEN = "\033[32m"
 YELLOW = "\033[33m"
 CYAN = "\033[36m"
+MAGENTA = "\033[95m"
 WHITE = "\033[97m"
 GREY = "\033[90m"
 BG_RED = "\033[41m"
@@ -253,6 +277,8 @@ class Case:
     is_backup: bool = False
     last_reply: Optional[datetime] = None
     last_reply_author: str = ""
+    co_tam: bool = False
+    jira_keys: List[str] = field(default_factory=list)
 
     def portal_url(self) -> str:
         return PORTAL_CASE.format(number=self.number)
@@ -353,7 +379,7 @@ def _decode_http_body(raw: bytes, headers) -> str:
     return raw.decode(errors="replace")
 
 
-def _http_json(url: str, payload: dict, token: str) -> dict:
+def _http_json(url: str, payload: dict, token: str, timeout: Optional[float] = None) -> dict:
     raw = json.dumps(payload).encode()
     req = urllib.request.Request(
         url,
@@ -369,7 +395,7 @@ def _http_json(url: str, payload: dict, token: str) -> dict:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+        with urllib.request.urlopen(req, timeout=timeout if timeout is not None else GQL_TIMEOUT) as resp:
             body = _decode_http_body(resp.read(), resp.headers)
             return json.loads(body) if body else {}
     except socket.timeout as exc:
@@ -412,7 +438,7 @@ def graphql(
         payload["variables"] = variables
     if operation_name:
         payload["operationName"] = operation_name
-    data = _http_json(GRAPHQL_URL, payload, token)
+    data = _http_json(GRAPHQL_URL, payload, token, timeout=GQL_TIMEOUT)
     if debug and data.get("errors"):
         print("GraphQL errors:", json.dumps(data["errors"], indent=2)[:4000], file=sys.stderr)
     if data.get("errors") and data.get("data") is None:
@@ -631,6 +657,7 @@ def fetch_account_nodes(
         pages += 1
         if page.get("hasNextPage") and page.get("endCursor"):
             after = page["endCursor"]
+            time.sleep(PAGE_SLEEP)
             continue
         break
 
@@ -651,24 +678,36 @@ def comments_from_node(node: dict) -> List[str]:
     return authors
 
 
-def fetch_comment_activity(case_ids: Sequence[str]) -> Tuple[Set[str], Dict[str, Tuple[str, str]]]:
-    """Return (commented_by_me, last_comment) keyed by Salesforce Id.
+def fetch_comment_activity(
+    case_ids: Sequence[str],
+) -> Tuple[Set[str], Dict[str, Tuple[str, str]], Dict[str, List[str]], int]:
+    """Return (commented_by_me, last_comment, all_authors, api_calls).
 
     Batches of 10 + full cursor pagination so a chatty case cannot starve a quiet one.
+    api_calls is the real gql() count across every batch and page (error #25).
+    Body__c is scraped for Jira browse URLs into LAST_CASE_JIRAS.
     """
+    global LAST_CASE_JIRAS
     case_ids = [cid for cid in case_ids if cid]
     commented_by_me: Set[str] = set()
     last_comment: Dict[str, Tuple[str, str]] = {}
+    authors_by_case: Dict[str, Set[str]] = defaultdict(set)
+    case_jiras: Dict[str, Set[str]] = defaultdict(set)
     batch_size = 10
     page_size = 200
     max_pages = 25
+    api_calls = 0
     token = get_access_token()
 
     for i in range(0, len(case_ids), batch_size):
+        if i:
+            time.sleep(BATCH_SLEEP)
         batch = case_ids[i : i + batch_size]
         id_list = ", ".join(f'"{cid}"' for cid in batch)
         cursor = None
         for _page in range(max_pages):
+            if _page:
+                time.sleep(PAGE_SLEEP)
             after_clause = f'after: "{cursor}"' if cursor else ""
             query = f"""
 query CommentActivity {{
@@ -684,6 +723,7 @@ query CommentActivity {{
           node {{
             Case__c {{ value }}
             CreatedDate {{ value }}
+            Body__c {{ value }}
             CreatedBy {{ Name {{ value }} }}
           }}
         }}
@@ -694,10 +734,12 @@ query CommentActivity {{
 """
             try:
                 data = graphql(query, token, operation_name="CommentActivity")
+                api_calls += 1
             except urllib.error.HTTPError as exc:
                 if exc.code == 401:
                     token = get_access_token(force=True)
                     data = graphql(query, token, operation_name="CommentActivity")
+                    api_calls += 1
                 else:
                     raise
             if data.get("errors") and not ((data.get("data") or {}).get("redhat_support_uiapi")):
@@ -716,21 +758,29 @@ query CommentActivity {{
                     continue
                 created = v(node.get("CreatedDate"))
                 author = v((node.get("CreatedBy") or {}).get("Name"))
-                if isinstance(cid, str) is False:
+                body = v(node.get("Body__c"))
+                if not isinstance(cid, str):
                     cid = str(cid)
+                if author:
+                    authors_by_case[cid].add(str(author))
                 if author and MY_NAME.lower() in str(author).lower():
                     commented_by_me.add(cid)
                 created_s = str(created) if created else ""
                 author_s = str(author) if author else ""
                 if created_s and (cid not in last_comment or created_s > last_comment[cid][0]):
                     last_comment[cid] = (created_s, author_s)
+                if body:
+                    for match in JIRA_RE.finditer(html.unescape(str(body))):
+                        case_jiras[cid].add(match.group(1))
             page_info = payload.get("pageInfo") or {}
             if not page_info.get("hasNextPage") or not edges:
                 break
             cursor = page_info.get("endCursor")
             if not cursor:
                 break
-    return commented_by_me, last_comment
+    LAST_CASE_JIRAS = {cid: sorted(keys) for cid, keys in case_jiras.items()}
+    all_authors = {cid: sorted(names) for cid, names in authors_by_case.items()}
+    return commented_by_me, last_comment, all_authors, api_calls
 
 
 def _escalation_query() -> str:
@@ -791,7 +841,9 @@ def fetch_escalations(debug: bool = False) -> Tuple[List[dict], List[str]]:
     seen: Set[str] = set()
     failed: List[str] = []
     query = _escalation_query()
-    for term in accounts:
+    for acct_i, term in enumerate(accounts):
+        if acct_i:
+            time.sleep(BATCH_SLEEP)
         after = None
         pages = 0
         try:
@@ -822,6 +874,7 @@ def fetch_escalations(debug: bool = False) -> Tuple[List[dict], List[str]]:
                 pages += 1
                 if page.get("hasNextPage") and page.get("endCursor"):
                     after = page["endCursor"]
+                    time.sleep(PAGE_SLEEP)
                     continue
                 break
         except Exception:
@@ -888,6 +941,8 @@ def fetch_cases_by_ids(ids: Sequence[str], debug: bool = False) -> Tuple[List[di
     failed = False
     query = _cases_by_ids_query()
     for i in range(0, len(ids), 20):
+        if i:
+            time.sleep(BATCH_SLEEP)
         batch = ids[i : i + 20]
         try:
             data = graphql(
@@ -1066,6 +1121,57 @@ def fuzzy_contact(contact: str, names: Sequence[str]) -> bool:
     return is_tam_contact(contact, "_", {"_": list(names)})
 
 
+def is_co_tam(name: str, account_short: str) -> bool:
+    if not name or not str(name).strip():
+        return False
+    n = str(name).lower().strip()
+    for full in CO_TAMS.get(account_short, []):
+        f = str(full).lower().strip()
+        if len(f) >= 4 and f in n:
+            return True
+        if len(n) >= 4 and n in f:
+            return True
+    return False
+
+
+def is_co_tam_case(
+    case: Case,
+    all_authors: Optional[Dict[str, Sequence[str]]] = None,
+    account_short: Optional[str] = None,
+) -> bool:
+    """True if a colleague owns this case, or has ever commented on it."""
+    acct = account_short or case.account_label
+    if is_co_tam(case.owner, acct):
+        return True
+    authors = []
+    if all_authors:
+        authors = list(all_authors.get(case.id, ()))
+    authors.extend(case.comment_authors or [])
+    for author in authors:
+        if is_co_tam(author, acct):
+            return True
+    return False
+
+
+def is_mine_visible(
+    case: Case,
+    commented_ids: Set[str],
+    all_authors: Optional[Dict[str, Sequence[str]]] = None,
+    contacts: Optional[Dict[str, List[str]]] = None,
+) -> bool:
+    """Does this belong on --mine: replied, TAM contact, co-TAM, or unclaimed."""
+    if case.id in commented_ids or case.mine:
+        return True
+    if case.unclaimed:
+        return True
+    contacts = contacts if contacts is not None else load_contacts()
+    if is_tam_contact(case.contact, case.account_label, contacts):
+        return True
+    if is_co_tam_case(case, all_authors, case.account_label):
+        return True
+    return False
+
+
 def product_matches(product: str, filters: Optional[Sequence[str]]) -> bool:
     if not filters:
         return True
@@ -1163,7 +1269,9 @@ def fetch_all_cases(
     raw_nodes: List[Tuple[str, dict]] = []
     failed_accounts: List[str] = []
     source = accounts if accounts is not None else ACCOUNTS
-    for term, label in source.items():
+    for i, (term, label) in enumerate(source.items()):
+        if i:
+            time.sleep(BATCH_SLEEP)
         if debug:
             print(f"Fetching {label} ({term})...", file=sys.stderr)
         try:
@@ -1200,7 +1308,7 @@ def fetch_all_cases(
             continue
         if sbr_filter and sbr_filter.lower() not in (case.sbr or "").lower():
             continue
-        if mine_only and not (case.mine or case.unclaimed or case.is_contact):
+        if mine_only and not is_mine_visible(case, set(), None, contacts):
             continue
         cases.append(case)
 
@@ -1241,8 +1349,12 @@ def fetch_backup_accounts_cases(
     )
 
 
-def apply_comment_activity(cases: Sequence[Case]) -> Tuple[Set[str], Dict[str, Tuple[str, str]]]:
-    commented, last_comment = fetch_comment_activity([c.id for c in cases if c.id])
+def apply_comment_activity(
+    cases: Sequence[Case],
+) -> Tuple[Set[str], Dict[str, Tuple[str, str]], Dict[str, List[str]]]:
+    commented, last_comment, all_authors, _api_calls = fetch_comment_activity(
+        [c.id for c in cases if c.id]
+    )
     for case in cases:
         if case.id in commented:
             case.mine = True
@@ -1252,7 +1364,15 @@ def apply_comment_activity(cases: Sequence[Case]) -> Tuple[Set[str], Dict[str, T
         if info:
             case.last_reply = parse_dt(info[0])
             case.last_reply_author = info[1] or ""
-    return commented, last_comment
+        extra = all_authors.get(case.id) or []
+        if extra:
+            merged = list(dict.fromkeys(list(case.comment_authors) + list(extra)))
+            case.comment_authors = merged
+        case.jira_keys = list(LAST_CASE_JIRAS.get(case.id) or [])
+        case.co_tam = is_co_tam_case(case, all_authors, case.account_label)
+        if case.co_tam and not case.mine and not case.is_contact:
+            case.marker = "✱"
+    return commented, last_comment, all_authors
 
 
 def apply_escalation_marks(cases: Sequence[Case], esc_ids: Set[str]) -> None:
@@ -1260,14 +1380,13 @@ def apply_escalation_marks(cases: Sequence[Case], esc_ids: Set[str]) -> None:
         case.escalated = bool(case.id and case.id in esc_ids)
 
 
-def is_my_case(case: Case, commented_ids: Set[str], contacts: Dict[str, List[str]]) -> bool:
-    if case.id in commented_ids or case.mine:
-        return True
-    if is_tam_contact(case.contact, case.account_label, contacts):
-        return True
-    if name_is_mine(case.owner):
-        return True
-    return False
+def is_my_case(
+    case: Case,
+    commented_ids: Set[str],
+    contacts: Dict[str, List[str]],
+    all_authors: Optional[Dict[str, Sequence[str]]] = None,
+) -> bool:
+    return is_mine_visible(case, commented_ids, all_authors, contacts)
 
 
 def nodes_to_cases(nodes: Sequence[dict], is_backup: bool = False) -> List[Case]:
@@ -1321,6 +1440,14 @@ def account_color(label: str) -> str:
     return ACCOUNT_PALETTE[sum(ord(ch) for ch in label) % len(ACCOUNT_PALETTE)]
 
 
+def account_sort_key(cases: Sequence[Case]) -> Tuple[int, str]:
+    """Worst (most negative / soonest) SBT first. Empty groups sort last."""
+    sbts = [c.sbt for c in cases if c.sbt is not None]
+    worst = min(sbts) if sbts else 10**9
+    label = cases[0].account_label.lower() if cases else ""
+    return (worst, label)
+
+
 def grouped_cases(cases: Sequence[Case]) -> List[Tuple[str, List[Case]]]:
     buckets: Dict[str, List[Case]] = {}
     for case in cases:
@@ -1329,7 +1456,10 @@ def grouped_cases(cases: Sequence[Case]) -> List[Tuple[str, List[Case]]]:
         info = LAST_WOC.get(label) or {}
         if label not in buckets and info.get("count"):
             buckets[label] = []
-    return [(label, buckets[label]) for label in sorted(buckets, key=str.lower)]
+    return [
+        (label, buckets[label])
+        for label in sorted(buckets, key=lambda a: account_sort_key(buckets[a]))
+    ]
 
 
 def now_stamp() -> str:
@@ -1375,6 +1505,8 @@ def fmt_row(case: Case, width: int) -> str:
         marker = paint("●", GREEN)
     elif case.is_contact:
         marker = paint("◆", YELLOW)
+    elif case.co_tam:
+        marker = paint("✱", CYAN)
     else:
         marker = paint("○", DIM)
 
@@ -1397,16 +1529,18 @@ def fmt_row(case: Case, width: int) -> str:
         caseno = paint(f"{case.number:<10}", RED, BOLD)
     else:
         caseno = paint(f"{case.number:<10}", CYAN)
-    subject = case.subject or ""
+    marks = ""
     if case.escalated:
-        subject = "▲ " + subject
-        subject = paint(subject, RED, BOLD)
+        marks += paint("▲ ", RED, BOLD)
+    if case.jira_keys:
+        marks += paint("▪ ", MAGENTA)
+    body = case.subject or ""
+    if case.escalated:
+        body = paint(body, RED, BOLD)
+    subject = marks + body
     prefix = f"{caseno} {sev} {st} {sbt} {owner} {reply} {contact} "
     remain = max(20, width - len(re.sub(r"\033\[[0-9;]*m", "", prefix)) - 1)
-    if case.escalated:
-        line = prefix + subject[: remain + 20]
-    else:
-        line = prefix + (case.subject or "")[:remain]
+    line = prefix + subject[: remain + 40]
     if case.unclaimed and not is_breached(case):
         return paint(re.sub(r"\033\[[0-9;]*m", "", line), DARK)
     return line
@@ -1452,7 +1586,7 @@ def render_terminal(cases: List[Case], extra: str = "") -> None:
         f"updated {LAST_FETCH.get('updated', '')}  {extra}"
     )
     print(paint(stats, DIM))
-    print(paint("● replied  ◆ TAM contact  ○ other  grey = new unclaimed  red CASE# = SBT breached  ▲ = escalated", DIM))
+    print(paint("● replied  ◆ TAM contact  ✱ co-TAM  ○ other  grey = new unclaimed  red CASE# = SBT breached  ▲ escalated  ▪ Jira", DIM))
 
 
 # ── Webhooks ─────────────────────────────────────────────────────────────────
@@ -1701,7 +1835,7 @@ def build_parser(description: str) -> argparse.ArgumentParser:
     parser.add_argument(
         "--mine",
         action="store_true",
-        help="Only ● cases, ◆ TAM contacts, and new unclaimed",
+        help="Only replied, TAM contacts, co-TAM, and new unclaimed",
     )
     parser.add_argument(
         "--worh",
@@ -1757,14 +1891,15 @@ def load_cases(args: argparse.Namespace) -> List[Case]:
         sbr_filter=args.sbr,
         debug=args.debug,
     )
-    apply_comment_activity(cases)
+    commented, _last, all_authors = apply_comment_activity(cases)
     try:
         esc, esc_failed = fetch_escalations(debug=args.debug)
     except Exception:
         esc, esc_failed = [], ["escalations"]
     apply_escalation_marks(cases, escalation_parent_ids(esc))
     if args.mine:
-        cases = [c for c in cases if c.mine or c.unclaimed or c.is_contact]
+        contacts = load_contacts()
+        cases = [c for c in cases if is_mine_visible(c, commented, all_authors, contacts)]
     if getattr(args, "worh", False):
         cases = [c for c in cases if c.status in ("WoRH", "InPrg")]
     LAST_FETCH["failed"] = list(failed) + list(esc_failed)
@@ -1786,7 +1921,7 @@ def load_tui_board(
         product_filter=product, sbr_filter=sbr, debug=debug
     )
     all_open = list(cases) + list(backup)
-    commented, _last = apply_comment_activity(all_open)
+    commented, last_comment, all_authors = apply_comment_activity(all_open)
     try:
         esc, esc_failed = fetch_escalations(debug=debug)
     except Exception:
@@ -1803,14 +1938,27 @@ def load_tui_board(
         parent_cases = [c for c in prev_parents if c.id in esc_ids]
     else:
         parent_cases = [c for c in nodes_to_cases(parent_nodes) if not is_closed(c)]
-    apply_comment_activity(parent_cases)
+    prior_jiras = dict(LAST_CASE_JIRAS)
+    _, _, parent_authors = apply_comment_activity(parent_cases)
+    for cid, names in parent_authors.items():
+        all_authors.setdefault(cid, [])
+        all_authors[cid] = list(dict.fromkeys(list(all_authors[cid]) + list(names)))
+    for cid, keys in LAST_CASE_JIRAS.items():
+        prior_jiras.setdefault(cid, [])
+        prior_jiras[cid] = list(dict.fromkeys(list(prior_jiras[cid]) + list(keys)))
+    LAST_CASE_JIRAS.clear()
+    LAST_CASE_JIRAS.update(prior_jiras)
     apply_escalation_marks(parent_cases, esc_ids)
     contacts = load_contacts()
     extra = [c for c in parent_cases if c.id not in known_ids]
-    mine_parents = [c for c in extra if is_my_case(c, commented, contacts)]
-    other_parents = [c for c in extra if not is_my_case(c, commented, contacts)]
+    mine_parents = [
+        c for c in extra if is_mine_visible(c, commented, all_authors, contacts)
+    ]
+    other_parents = [
+        c for c in extra if not is_mine_visible(c, commented, all_authors, contacts)
+    ]
     if args.mine:
-        keep = lambda c: c.mine or c.unclaimed or c.is_contact
+        keep = lambda c: is_mine_visible(c, commented, all_authors, contacts)
         cases = [c for c in cases if keep(c)]
         backup = [c for c in backup if keep(c)]
     if getattr(args, "worh", False):
@@ -1828,8 +1976,760 @@ def load_tui_board(
         "esc_ids": esc_ids,
         "parent_cases": parent_cases,
         "commented": commented,
+        "last_comment": last_comment,
+        "all_authors": all_authors,
+        "case_jiras": dict(LAST_CASE_JIRAS),
         "failed": LAST_FETCH["failed"],
     }
+
+
+# ── Latency history ──────────────────────────────────────────────────────────
+
+def measure_path_latency(host: str = "graphql.redhat.com", port: int = 443, timeout: int = 5):
+    """Bare TCP connect to the API host. Returns milliseconds, or None."""
+    t0 = time.time()
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            pass
+        return round((time.time() - t0) * 1000, 1)
+    except Exception:
+        return None
+
+
+def log_latency_sample(elapsed, n_cases=0, n_api=0, n_failed=0, path_ms=None):
+    """Never raises — a logging failure must not take the refresh down."""
+    try:
+        line = json.dumps(
+            {
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "elapsed": round(float(elapsed), 2),
+                "cases": n_cases,
+                "api_calls": n_api,
+                "failed": n_failed,
+                "path_ms": path_ms,
+            }
+        )
+        with LATENCY_LOG_PATH.open("a") as handle:
+            handle.write(line + "\n")
+    except Exception:
+        return
+    try:
+        if os.urandom(1)[0] == 0 and LATENCY_LOG_PATH.exists():
+            lines = LATENCY_LOG_PATH.read_text().splitlines()
+            if len(lines) > LATENCY_LOG_MAX_LINES:
+                LATENCY_LOG_PATH.write_text(
+                    "\n".join(lines[-LATENCY_LOG_MAX_LINES:]) + "\n"
+                )
+    except Exception:
+        return
+
+
+def load_latency_history(limit: int = 2000) -> List[dict]:
+    if not LATENCY_LOG_PATH.exists():
+        return []
+    out = []
+    try:
+        lines = LATENCY_LOG_PATH.read_text().splitlines()
+    except Exception:
+        return []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except Exception:
+            continue
+    return out[-limit:]
+
+
+def latency_gradient_colour(pct: float) -> str:
+    pct = max(0.0, min(1.0, float(pct)))
+    r = int(0x33 + (0xFF - 0x33) * pct)
+    g = int(0xCC + (0x33 - 0xCC) * pct)
+    b = int(0x33 + (0x33 - 0x33) * pct)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def latency_relative_colour(values: Sequence[float], current: float) -> str:
+    nums = [float(v) for v in values if v is not None]
+    if len(nums) < 2 or max(nums) <= min(nums):
+        return "#aaaaaa"
+    lo, hi = min(nums), max(nums)
+    return latency_gradient_colour((float(current) - lo) / (hi - lo))
+
+
+def latency_trend_arrow(elapsed: float, prev_samples: Sequence[float]) -> Tuple[str, str]:
+    if not prev_samples:
+        return "", "#aaaaaa"
+    avg = sum(prev_samples) / len(prev_samples)
+    delta = (elapsed - avg) / avg if avg > 0 else 0
+    if delta > 0.10:
+        return "↑", "#ff3333"
+    if delta < -0.10:
+        return "↓", "#33cc33"
+    return "→", "#aaaaaa"
+
+
+def latency_p50_p90(values: Sequence[float]) -> Tuple[float, float]:
+    nums = sorted(float(v) for v in values if v is not None)
+    if not nums:
+        return 0.0, 0.0
+    def _pct(p):
+        idx = min(len(nums) - 1, max(0, int(round((len(nums) - 1) * p))))
+        return nums[idx]
+    return _pct(0.50), _pct(0.90)
+
+
+def same_local_day(ts: str, day) -> bool:
+    try:
+        parsed = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        if parsed.tzinfo:
+            parsed = parsed.astimezone()
+        return parsed.date() == day
+    except Exception:
+        return False
+
+
+# ── Jira Cloud ───────────────────────────────────────────────────────────────
+
+def jira_token_present() -> bool:
+    try:
+        return JIRA_TOKEN_PATH.exists() and bool(JIRA_TOKEN_PATH.read_text().strip())
+    except Exception:
+        return False
+
+
+def _jira_auth_header() -> dict:
+    cfg = load_config()
+    email = cfg.get("jira_email") or f"{SSO_USERNAME.replace('rhn-support-', '')}@redhat.com"
+    try:
+        token = JIRA_TOKEN_PATH.read_text().strip()
+    except Exception:
+        token = ""
+    b64 = base64.b64encode(f"{email}:{token}".encode()).decode()
+    return {"Authorization": f"Basic {b64}", "Accept": "application/json"}
+
+
+def fetch_jira_issue(key: str) -> Optional[dict]:
+    url = (
+        f"{JIRA_BASE}/rest/api/3/issue/{urllib.parse.quote(key)}"
+        "?fields=status,summary,updated,comment&expand=changelog"
+    )
+    try:
+        req = urllib.request.Request(url, headers=_jira_auth_header())
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read())
+    except Exception as exc:
+        print(f"  jira {key}: {exc}", file=sys.stderr)
+        return None
+
+
+def fetch_watched_jira_keys() -> List[str]:
+    """POST /rest/api/3/search/jql — GET /search is HTTP 410 Gone."""
+    keys: List[str] = []
+    token = None
+    for _page in range(20):
+        payload: dict = {
+            "jql": "watcher = currentUser()",
+            "maxResults": 100,
+            "fields": ["key"],
+        }
+        if token:
+            payload["nextPageToken"] = token
+        try:
+            req = urllib.request.Request(
+                f"{JIRA_BASE}/rest/api/3/search/jql",
+                data=json.dumps(payload).encode(),
+                headers={**_jira_auth_header(), "Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                data = json.loads(resp.read())
+        except Exception as exc:
+            print(f"  jira watched: {exc}", file=sys.stderr)
+            break
+        for issue in data.get("issues") or []:
+            key = issue.get("key")
+            if key:
+                keys.append(key)
+        if data.get("isLast") or not data.get("nextPageToken"):
+            break
+        token = data.get("nextPageToken")
+    return keys
+
+
+def jira_last_status_change(issue_data: dict) -> Optional[str]:
+    latest = None
+    for hist in ((issue_data or {}).get("changelog") or {}).get("histories") or []:
+        if any((item.get("field") or "").lower() == "status" for item in hist.get("items") or []):
+            created = hist.get("created")
+            if created and (latest is None or created > latest):
+                latest = created
+    return latest
+
+
+def jira_last_activity(issue_data: dict) -> str:
+    status_ts = jira_last_status_change(issue_data) or ""
+    updated = ((issue_data or {}).get("fields") or {}).get("updated") or ""
+    return max(status_ts, updated)
+
+
+def jira_comments_since(issue_data: dict, cutoff_iso: Optional[str]) -> List[Tuple[str, str]]:
+    out = []
+    comments = (((issue_data or {}).get("fields") or {}).get("comment") or {}).get("comments") or []
+    for comment in comments:
+        created = comment.get("created") or ""
+        if cutoff_iso and created <= cutoff_iso:
+            continue
+        author = ((comment.get("author") or {}).get("displayName")) or ""
+        out.append((created, author))
+    return out
+
+
+def jira_change_summary(issue_data: dict, cutoff_iso: Optional[str]) -> str:
+    parts = []
+    transition = jira_last_status_transition(issue_data, cutoff_iso)
+    if transition:
+        parts.append(f"status: {transition[0]} → {transition[1]}")
+    comments = jira_comments_since(issue_data, cutoff_iso)
+    if comments:
+        latest = comments[-1][1] or "unknown"
+        parts.append(f"{len(comments)} new comment{'s' if len(comments) != 1 else ''}, latest by {latest}")
+    return "; ".join(parts) or "updated"
+
+
+def jira_last_status_transition(
+    issue_data: dict, cutoff_iso: Optional[str]
+) -> Optional[Tuple[str, str]]:
+    latest = None
+    for hist in ((issue_data or {}).get("changelog") or {}).get("histories") or []:
+        created = hist.get("created") or ""
+        if cutoff_iso and created <= cutoff_iso:
+            continue
+        for item in hist.get("items") or []:
+            if (item.get("field") or "").lower() != "status":
+                continue
+            if latest is None or created > latest[0]:
+                latest = (created, item.get("fromString") or "?", item.get("toString") or "?")
+    if not latest:
+        return None
+    return (latest[1], latest[2])
+
+
+def jira_browse_url(key: str) -> str:
+    return JIRA_BROWSE_URL.format(key=key)
+
+
+def jira_is_closed(issue_data: Optional[dict]) -> bool:
+    name = ((((issue_data or {}).get("fields") or {}).get("status") or {}).get("name") or "")
+    return name.strip().lower() in {"closed", "done", "resolved", "cancelled"}
+
+
+def _load_json_cache(path: Path, default):
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return default
+
+
+def _save_json_cache(path: Path, data) -> None:
+    try:
+        path.write_text(json.dumps(data, indent=2) + "\n")
+        os.chmod(path, 0o600)
+    except Exception:
+        return
+
+
+def load_jira_alert_cache() -> dict:
+    data = _load_json_cache(JIRA_ALERT_CACHE_PATH, {})
+    return data if isinstance(data, dict) else {}
+
+
+def save_jira_alert_cache(data: dict) -> None:
+    _save_json_cache(JIRA_ALERT_CACHE_PATH, data)
+
+
+def load_id_set_cache(path: Path) -> Set[str]:
+    data = _load_json_cache(path, [])
+    if isinstance(data, list):
+        return set(str(x) for x in data)
+    if isinstance(data, dict):
+        return set(str(x) for x in data.keys())
+    return set()
+
+
+def save_id_set_cache(path: Path, ids: Set[str]) -> None:
+    _save_json_cache(path, sorted(ids))
+
+
+def webhook_notify_jira(
+    webhook_url: str,
+    webhook_type: str,
+    key: str,
+    summary: str,
+    change: str,
+    case: Optional[Case] = None,
+) -> None:
+    if not webhook_url:
+        return
+    title = f"🔷 {key}"
+    url = jira_browse_url(key)
+    if webhook_type == "slack":
+        fields = [{"type": "mrkdwn", "text": f"*Change*\n{change}"}]
+        if case:
+            fields.append({"type": "mrkdwn", "text": f"*Case*\n{case.number}"})
+        payload = {
+            "text": f"{title} — {summary}",
+            "blocks": [
+                {"type": "header", "text": {"type": "plain_text", "text": f"{title} — {summary}"}},
+                {"type": "section", "fields": fields},
+                {
+                    "type": "actions",
+                    "elements": [
+                        {"type": "button", "text": {"type": "plain_text", "text": "Open Jira"}, "url": url}
+                    ],
+                },
+            ],
+        }
+    else:
+        widgets = [
+            {"decoratedText": {"topLabel": "Change", "text": change}},
+            {"buttonList": {"buttons": [{"text": "Open Jira", "onClick": {"openLink": {"url": url}}}]}},
+        ]
+        payload = {
+            "cardsV2": [
+                {
+                    "cardId": key,
+                    "card": {
+                        "header": {"title": title, "subtitle": summary},
+                        "sections": [{"widgets": widgets}],
+                    },
+                }
+            ]
+        }
+    _post_webhook(webhook_url, payload)
+
+
+def webhook_notify_integrity(
+    webhook_url: str,
+    webhook_type: str,
+    case: Case,
+    event: str,
+    detail: str,
+    accent: str,
+    icon: str,
+) -> None:
+    if not webhook_url:
+        return
+    title = f"{icon} {case.number} — {event}"
+    if webhook_type == "slack":
+        payload = {
+            "text": title,
+            "blocks": [
+                {"type": "header", "text": {"type": "plain_text", "text": title}},
+                {"type": "section", "text": {"type": "mrkdwn", "text": detail}},
+                {
+                    "type": "actions",
+                    "elements": [
+                        {"type": "button", "text": {"type": "plain_text", "text": "Case in Portal"}, "url": case.portal_url()},
+                        {"type": "button", "text": {"type": "plain_text", "text": "Case in SFDC"}, "url": case.sfdc_url()},
+                    ],
+                },
+            ],
+        }
+    else:
+        payload = {
+            "cardsV2": [
+                {
+                    "cardId": f"{case.number}-{event}",
+                    "card": {
+                        "header": {"title": title, "subtitle": case.subject or ""},
+                        "sections": [
+                            {
+                                "widgets": [
+                                    {"decoratedText": {"topLabel": "Detail", "text": detail}},
+                                    {
+                                        "buttonList": {
+                                            "buttons": [
+                                                {"text": "Case in Portal", "onClick": {"openLink": {"url": case.portal_url()}}},
+                                                {"text": "Case in SFDC", "onClick": {"openLink": {"url": case.sfdc_url()}}},
+                                            ]
+                                        }
+                                    },
+                                ]
+                            }
+                        ],
+                    },
+                }
+            ]
+        }
+    _post_webhook(webhook_url, payload)
+
+
+# ── Case history / integrity ─────────────────────────────────────────────────
+
+_STATUS_VOCAB = {
+    "waiting on red hat",
+    "in progress",
+    "waiting on customer action required",
+    "waiting on customer solution provided",
+    "waiting on customer",
+    "waiting on engineering",
+    "waiting on collaboration",
+    "waiting on translation",
+    "waiting on documentation",
+    "waiting on 3rd party",
+    "waiting on business unit",
+    "unassigned",
+    "closed",
+    "new",
+    "waiting on contributor",
+    "waiting on product management",
+    "waiting on quality engineering",
+    "waiting on partner",
+}
+
+
+def _is_sf_id(value: str) -> bool:
+    return bool(re.fullmatch(r"[a-zA-Z0-9]{15}([a-zA-Z0-9]{3})?", value or ""))
+
+
+def _history_string(field) -> str:
+    if field is None:
+        return ""
+    if isinstance(field, dict):
+        if "value" in field:
+            return str(field.get("value") or "")
+        inner = field.get("RedHatSupportStringValue") or field
+        return str(inner.get("value") or "")
+    return str(field)
+
+
+def _history_node_row(node: dict, fallback_cid: str = "") -> dict:
+    cid = v(node.get("CaseId")) or fallback_cid
+    return {
+        "id": node.get("Id") or "",
+        "case_id": str(cid) if cid else "",
+        "created": v(node.get("CreatedDate")) or "",
+        "old": _history_string(node.get("OldValue")),
+        "new": _history_string(node.get("NewValue")),
+    }
+
+
+def fetch_case_histories(case_ids: Sequence[str]) -> Dict[str, List[dict]]:
+    """Batch CaseHistory via CaseId in:[...], 10 ids, full pagination (Step 12)."""
+    out: Dict[str, List[dict]] = defaultdict(list)
+    ids = [cid for cid in case_ids if cid]
+    batch_size = 10
+    page_size = 100
+    max_pages = 25
+    for i in range(0, len(ids), batch_size):
+        if i:
+            time.sleep(BATCH_SLEEP)
+        batch = ids[i : i + batch_size]
+        id_list = ", ".join(f'"{cid}"' for cid in batch)
+        fallback = batch[0] if len(batch) == 1 else ""
+        cursor = None
+        for page in range(max_pages):
+            if page:
+                time.sleep(PAGE_SLEEP)
+            after = f'after: "{cursor}"' if cursor else ""
+            query = f"""
+query CaseHistories {{
+  redhat_support_uiapi {{
+    query {{
+      RedHatSupportCaseHistory(
+        first: {page_size}
+        {after}
+        where: {{ CaseId: {{ in: [{id_list}] }} }}
+      ) {{
+        pageInfo {{ hasNextPage endCursor }}
+        edges {{ node {{
+          Id
+          CaseId {{ value }}
+          CreatedDate {{ value }}
+          OldValue {{ ... on RedHatSupportStringValue {{ value }} }}
+          NewValue {{ ... on RedHatSupportStringValue {{ value }} }}
+        }} }}
+      }}
+    }}
+  }}
+}}
+"""
+            try:
+                data = gql(query, operation_name="CaseHistories")
+            except Exception as exc:
+                print(f"  histories batch: {exc}", file=sys.stderr)
+                break
+            payload = (
+                ((data.get("data") or {}).get("redhat_support_uiapi") or {})
+                .get("query", {})
+                .get("RedHatSupportCaseHistory")
+                or {}
+            )
+            edges = payload.get("edges") or []
+            for edge in edges:
+                row = _history_node_row(edge.get("node") or {}, fallback)
+                if row["case_id"]:
+                    out[row["case_id"]].append(row)
+            page_info = payload.get("pageInfo") or {}
+            if not page_info.get("hasNextPage") or not edges:
+                break
+            cursor = page_info.get("endCursor")
+            if not cursor:
+                break
+    return dict(out)
+
+
+def fetch_case_history(case_id: str) -> List[dict]:
+    if not case_id:
+        return []
+    return fetch_case_histories([case_id]).get(case_id, [])
+
+
+def fetch_case_history_actors_batch(case_ids: Sequence[str]) -> Dict[str, str]:
+    """CreatedBy-only query — never mixed with Old/New (zero-row quirk)."""
+    out: Dict[str, str] = {}
+    ids = [cid for cid in case_ids if cid]
+    batch_size = 10
+    page_size = 100
+    max_pages = 25
+    for i in range(0, len(ids), batch_size):
+        if i:
+            time.sleep(BATCH_SLEEP)
+        batch = ids[i : i + batch_size]
+        id_list = ", ".join(f'"{cid}"' for cid in batch)
+        cursor = None
+        for page in range(max_pages):
+            if page:
+                time.sleep(PAGE_SLEEP)
+            after = f'after: "{cursor}"' if cursor else ""
+            query = f"""
+query CaseHistoryActors {{
+  redhat_support_uiapi {{
+    query {{
+      RedHatSupportCaseHistory(
+        first: {page_size}
+        {after}
+        where: {{ CaseId: {{ in: [{id_list}] }} }}
+      ) {{
+        pageInfo {{ hasNextPage endCursor }}
+        edges {{ node {{
+          Id
+          CreatedBy {{ Name {{ value }} }}
+        }} }}
+      }}
+    }}
+  }}
+}}
+"""
+            try:
+                data = gql(query, operation_name="CaseHistoryActors")
+            except Exception:
+                break
+            payload = (
+                ((data.get("data") or {}).get("redhat_support_uiapi") or {})
+                .get("query", {})
+                .get("RedHatSupportCaseHistory")
+                or {}
+            )
+            edges = payload.get("edges") or []
+            for edge in edges:
+                node = edge.get("node") or {}
+                hid = node.get("Id")
+                name = v((node.get("CreatedBy") or {}).get("Name"))
+                if hid and name:
+                    out[hid] = str(name)
+            page_info = payload.get("pageInfo") or {}
+            if not page_info.get("hasNextPage") or not edges:
+                break
+            cursor = page_info.get("endCursor")
+            if not cursor:
+                break
+    return out
+
+
+def fetch_case_history_actors(case_id: str) -> Dict[str, str]:
+    return fetch_case_history_actors_batch([case_id]) if case_id else {}
+
+
+def fetch_case_comment_timelines(case_ids: Sequence[str]) -> Dict[str, List[dict]]:
+    """Same 10-id batch + pagination as comment activity (Step 12)."""
+    out: Dict[str, List[dict]] = defaultdict(list)
+    ids = [cid for cid in case_ids if cid]
+    batch_size = 10
+    page_size = 100
+    max_pages = 25
+    for i in range(0, len(ids), batch_size):
+        if i:
+            time.sleep(BATCH_SLEEP)
+        batch = ids[i : i + batch_size]
+        id_list = ", ".join(f'"{cid}"' for cid in batch)
+        fallback = batch[0] if len(batch) == 1 else ""
+        cursor = None
+        for page in range(max_pages):
+            if page:
+                time.sleep(PAGE_SLEEP)
+            after = f'after: "{cursor}"' if cursor else ""
+            query = f"""
+query CaseCommentTimelines {{
+  redhat_support_uiapi {{
+    query {{
+      RedHatSupportCaseComment__c(
+        first: {page_size}
+        {after}
+        where: {{ Case__c: {{ in: [{id_list}] }} }}
+      ) {{
+        pageInfo {{ hasNextPage endCursor }}
+        edges {{ node {{
+          Case__c {{ value }}
+          CreatedDate {{ value }}
+          LastModifiedDate {{ value }}
+        }} }}
+      }}
+    }}
+  }}
+}}
+"""
+            try:
+                data = gql(query, operation_name="CaseCommentTimelines")
+            except Exception:
+                break
+            payload = (
+                ((data.get("data") or {}).get("redhat_support_uiapi") or {})
+                .get("query", {})
+                .get("RedHatSupportCaseComment__c")
+                or {}
+            )
+            edges = payload.get("edges") or []
+            for edge in edges:
+                node = edge.get("node") or {}
+                cid = v(node.get("Case__c")) or fallback
+                if not cid:
+                    continue
+                out[str(cid)].append(
+                    {
+                        "created": v(node.get("CreatedDate")) or "",
+                        "modified": v(node.get("LastModifiedDate")) or "",
+                    }
+                )
+            page_info = payload.get("pageInfo") or {}
+            if not page_info.get("hasNextPage") or not edges:
+                break
+            cursor = page_info.get("endCursor")
+            if not cursor:
+                break
+    return dict(out)
+
+
+def fetch_case_comment_timeline(case_id: str) -> List[dict]:
+    if not case_id:
+        return []
+    return fetch_case_comment_timelines([case_id]).get(case_id, [])
+
+
+def _classify_case_history(rows: Sequence[dict]) -> List[dict]:
+    classified = []
+    for row in rows:
+        old, new = row.get("old") or "", row.get("new") or ""
+        if _is_sf_id(old) or _is_sf_id(new):
+            kind = "id"
+        elif old.lower() in _STATUS_VOCAB or new.lower() in _STATUS_VOCAB:
+            kind = "status"
+        else:
+            kind = "owner"
+        classified.append({**row, "kind": kind})
+    return classified
+
+
+def _is_system_actor(name: str) -> bool:
+    n = (name or "").lower()
+    return any(token in n for token in ("migration", "workato", "integration"))
+
+
+def is_rfe_subject(subject: str) -> bool:
+    return "[rfe]" in (subject or "").lower()
+
+
+def detect_owner_reversion(rows: Sequence[dict]) -> List[dict]:
+    classified = _classify_case_history(rows)
+    by_ts: Dict[str, List[dict]] = defaultdict(list)
+    for row in classified:
+        by_ts[row.get("created") or ""].append(row)
+    flags = []
+    for ts, group in by_ts.items():
+        if any(r["kind"] == "status" for r in group):
+            continue
+        id_rows = [r for r in group if r["kind"] == "id"]
+        name_rows = [r for r in group if r["kind"] == "owner"]
+        for id_row in id_rows:
+            was_user = (id_row.get("old") or "").startswith("005")
+            now_group = (id_row.get("new") or "").startswith("00G")
+            if was_user and now_group:
+                name_row = name_rows[0] if name_rows else id_row
+                flags.append({**name_row, "kind": "owner_reversion", "created": ts})
+    return flags
+
+
+def _hours_apart(a: str, b: str) -> Optional[float]:
+    try:
+        da = datetime.fromisoformat(a.replace("Z", "+00:00"))
+        db = datetime.fromisoformat(b.replace("Z", "+00:00"))
+        return abs((da - db).total_seconds()) / 3600.0
+    except Exception:
+        return None
+
+
+def detect_status_gaming(rows: Sequence[dict], comments: Sequence[dict], subject: str = "") -> List[dict]:
+    if is_rfe_subject(subject):
+        return []
+    classified = [r for r in _classify_case_history(rows) if r["kind"] == "status"]
+    flags = []
+    waiting = lambda s: (s or "").lower().startswith("waiting on")
+
+    def _near_created(ts: str) -> bool:
+        for comment in comments:
+            gap = _hours_apart(ts, comment.get("created") or "")
+            if gap is not None and gap <= CASE_HISTORY_WINDOW_HOURS:
+                return True
+        return False
+
+    def _near_edited(ts: str) -> bool:
+        for comment in comments:
+            created_gap = _hours_apart(ts, comment.get("created") or "")
+            modified_gap = _hours_apart(ts, comment.get("modified") or "")
+            if modified_gap is not None and modified_gap <= CASE_HISTORY_WINDOW_HOURS:
+                if created_gap is None or created_gap > CASE_HISTORY_WINDOW_HOURS:
+                    return True
+        return False
+
+    for row in classified:
+        ts = row.get("created") or ""
+        if (row.get("new") or "").lower() == "in progress":
+            continue
+        if _near_created(ts):
+            continue
+        if _near_edited(ts):
+            flags.append({**row, "kind": "edited_comment"})
+        else:
+            flags.append({**row, "kind": "no_comment"})
+
+    for i, row in enumerate(classified):
+        left = (row.get("old") or "")
+        if not waiting(left) or left.lower() == "in progress":
+            continue
+        for later in classified[i + 1 :]:
+            gap = _hours_apart(row.get("created") or "", later.get("created") or "")
+            if gap is None or gap > CASE_ROUNDTRIP_HOURS:
+                continue
+            if (later.get("new") or "").lower() == left.lower():
+                if not _near_created(row.get("created") or "") and not _near_created(later.get("created") or ""):
+                    flags.append({**later, "kind": "roundtrip", "old": left, "new": later.get("new")})
+                break
+    return flags
 
 
 def ansi_to_rich(code: str) -> str:
@@ -1840,6 +2740,7 @@ def ansi_to_rich(code: str) -> str:
         GREY: "#555555",
         DIM: "#555555",
         CYAN: "cyan",
+        MAGENTA: "magenta",
         WHITE: "white",
     }.get(code, "white")
 
